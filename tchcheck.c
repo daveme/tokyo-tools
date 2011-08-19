@@ -84,7 +84,7 @@ typedef struct db_meta {
 
 } db_meta_t;
 
-void print_progress( FILE* file, time_t start_time, long long unsigned final, long long unsigned so_far )
+void print_progress( FILE* file, time_t start_time, long long unsigned final, long long unsigned so_far, bool finished )
 {
   time_t now  = time(NULL);
   if ( now > start_time ) {
@@ -95,10 +95,10 @@ void print_progress( FILE* file, time_t start_time, long long unsigned final, lo
     struct tm *the_time = localtime( &done_at);
 
     char time_buf[32];
-    char format_buf[128] = " [%10llu / %10llu] %10.2lf per second, %6.2lf%% done, finishing at %s";  
+    char format_buf[128] = " [%10llu / %10llu] %12.2lf per second, %6.2lf%% done, finishing at %s";  
     int eol_char_idx = strlen( format_buf );
 
-    if ( so_far >= final ) {
+    if ( so_far >= final || finished ) {
       format_buf[eol_char_idx] = '\n';
     } else {
       format_buf[eol_char_idx] = '\r';
@@ -186,10 +186,13 @@ void add_offset_to_tree_unless_exists( rbtree** tree, uint64_t offset, int64_t b
     sglib_rbtree_add( tree, new_node );
   } else {
     uint64_t diff = new_node->offset - other->offset;
-    fprintf(stderr, "Duplicate offset for value %llu at index %lls, other value %llu, other index %lls, diff %llu\n", 
-        (long long unsigned)new_node->offset, (long long)new_node->bucket_index,
-        (long long unsigned)other->offset   , (long long)other->bucket_index, 
-        (long long unsigned)diff);
+    // From Dave Simmonds: I'm going to make the assumption that if diff is 0, it's not a problem?!
+    if (diff)
+    // --------------------------------------------------------------------------------------------
+        fprintf(stderr, "Duplicate offset for value %llu at index %lld, other value %llu, other index %lld, diff %llu\n", 
+            (long long unsigned)new_node->offset, (long long)new_node->bucket_index,
+            (long long unsigned)other->offset   , (long long)other->bucket_index, 
+            (long long unsigned)diff);
     free( new_node );
   }
 
@@ -217,11 +220,11 @@ void dbmeta_populate_offset_tree( db_meta_t* dbmeta )
       add_offset_to_tree_unless_exists( &(dbmeta->offset_tree), offset, i );
     }
 
-    if ( i % 1000000 == 0 ) { print_progress( stderr, start, dbmeta->bucket_count, i ); }
+    if ( i % 1000000 == 0 ) { print_progress( stderr, start, dbmeta->bucket_count, i, false ); }
 
  }
 
- print_progress( stderr, start, dbmeta->bucket_count, i );
+ print_progress( stderr, start, dbmeta->bucket_count, i, true );
  fprintf( stderr, "Found %llu buckets with offsets\n", (long long unsigned)sglib_rbtree_len( dbmeta->offset_tree ));
  return;
 }
@@ -267,8 +270,10 @@ bool dbmeta_read_one_rec( db_meta_t *dbmeta, tcrec* rec )
     // get the location of the current read
     rec->offset = lseek64( dbmeta->fd, 0, SEEK_CUR );
 
+    errno = 0;
     if ( 1 != read(dbmeta->fd, &(rec->magic), 1 ) ) {
-      fprintf( stderr, "ERROR: Failure reading 1 byte, %s\n", strerror( errno ));
+      fflush(stdout);
+      fprintf( stderr, "\nERROR: Failure reading 1 byte, %s\n", strerror( errno ));
       return false;
     }
 
@@ -276,9 +281,12 @@ bool dbmeta_read_one_rec( db_meta_t *dbmeta, tcrec* rec )
       int length = 1;
   
       length += read( dbmeta->fd, &(rec->hash), 1 );
+
+      rec->left = 0;
       length += read( dbmeta->fd, &(rec->left), dbmeta->bytes_per );
       rec->left = rec->left << dbmeta->alignment_pow;
   
+      rec->right = 0;
       length += read( dbmeta->fd, &(rec->right), dbmeta->bytes_per );
       rec->right = rec->right << dbmeta->alignment_pow;
   
@@ -303,11 +311,13 @@ bool dbmeta_read_one_rec( db_meta_t *dbmeta, tcrec* rec )
   
     } else {
       // read a non-magic byte, so skip it
-      /*
+      /**/
+      if (!rec->magic) // this is not an error - there can be loads of 0's at the end of the file
+          return false;
       fprintf( stderr, "\nERROR : Read the start of a record at offset %llu, got %x instead of %x or %x\n",
             (long long unsigned)rec->offset, rec->magic, MAGIC_DATA_BLOCK, MAGIC_FREE_BLOCK );
       return false;
-      */
+      /**/
     }
   }
   fprintf(stderr, "\nERROR : read loop exited that should not have\n");
@@ -333,8 +343,10 @@ bool dbmeta_populate_record_tree( db_meta_t* dbmeta )
 
     // read a record
     if( !dbmeta_read_one_rec( dbmeta, &new_rec )) { 
-      fprintf( stderr, "Unable to find a record at the file is finished\n");
-      return false;
+      // may not be an error - because of 0's at end of file
+      // fprintf( stderr, "Unable to find a record at the file is finished\n");
+      // return false;
+      break;
     } else {
       offset = new_rec.offset + new_rec.length;
     }
@@ -379,10 +391,10 @@ bool dbmeta_populate_record_tree( db_meta_t* dbmeta )
     } else {
       fprintf( stderr, "NO record found at offset %llu\n", (long long unsigned)new_rec.offset );
     }
-    if ( (data_blocks + free_blocks) % 10000 == 0 ) { print_progress( stderr, start, st.st_size, offset ); }
+    if ( (data_blocks + free_blocks) % 10000 == 0 ) { print_progress( stderr, start, st.st_size, offset, false ); }
   }
 
-  print_progress( stderr, start, st.st_size, offset);
+  print_progress( stderr, start, st.st_size, offset, true);
 
   // if we are not at the end of the file, output the current file offset
   // with an appropriate message and return
@@ -400,7 +412,7 @@ void dbmeta_dump_tree( rbtree* tree, const char* fname )
   rbtree *element = sglib_rbtree_it_init( &iter, tree );
 
   while ( NULL != element ) {
-    fprintf( f, "%ld,%llu\n", (long long signed)element->bucket_index, (long long unsigned) element->offset );
+    fprintf( f, "%lld,%llu\n", (long long signed)element->bucket_index, (long long unsigned) element->offset );
     element = sglib_rbtree_it_next( &iter );
   }
   fclose( f );
